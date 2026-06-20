@@ -1,0 +1,266 @@
+name: Build & Release Wheel
+
+# Triggers:
+#   - Manual run from GitHub UI (Actions tab → "Run workflow")
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag name (e.g. v2026.4.1). Leave empty to use build number.'
+        required: false
+        default: ''
+
+# Required so the workflow can create/update Releases
+permissions:
+  contents: write
+
+jobs:
+  build-wheel:
+    name: Build CUDA Wheels
+    runs-on: ubuntu-latest
+
+    # nvidia/cuda devel image: includes nvcc + CUDA headers.
+    # No physical GPU needed — nvcc cross-compiles for specified arch targets.
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 0. Install Git before checkout — the CUDA Docker image does not include
+      #    git by default. Without it, actions/checkout falls back to the REST
+      #    API which does not support `submodules: true`.
+      # -----------------------------------------------------------------------
+      - name: Install Git
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -q
+          apt-get install -y --no-install-recommends git
+
+      # -----------------------------------------------------------------------
+      # 1. Checkout repo + submodules (glm headers live in a submodule)
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: colab-builder
+
+      - name: Clone upstream repository
+        run: |
+          git clone --recurse-submodules https://github.com/harry7557558/spirulae-splat.git upstream
+
+      - name: Apply Colab patches
+        run: |
+          cd upstream
+          git apply ../colab-builder/patches/001-setup-arch-list.patch
+          git apply ../colab-builder/patches/002-cuda-compat.patch
+
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -q
+          apt-get install -y --no-install-recommends software-properties-common curl git ninja-build cmake libgl1 libglib2.0-0
+          add-apt-repository ppa:deadsnakes/ppa -y
+          apt-get update -q
+          apt-get install -y --no-install-recommends \
+            python3.12 \
+            python3.12-dev \
+            python3.12-venv \
+            python3-pip
+          
+          # Make python3.12 the default python3
+          update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+          
+          # Install pip module for 3.12
+          curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+          python3 get-pip.py
+          
+          python3 --version
+
+      # -----------------------------------------------------------------------
+      # 3. Install PyTorch matching Colab's current default (cu128 = CUDA 12.8)
+      #    Update this when Colab upgrades its default PyTorch version.
+      # -----------------------------------------------------------------------
+      - name: Install PyTorch (Colab default)
+        run: |
+          pip3 install --upgrade pip
+          pip3 install \
+            torch==2.10.0 \
+            torchvision \
+            nvidia-cublas-cu12 \
+            nvidia-cuda-cupti-cu12 \
+            nvidia-cuda-nvrtc-cu12 \
+            nvidia-cuda-runtime-cu12 \
+            nvidia-cudnn-cu12 \
+            nvidia-cufft-cu12 \
+            nvidia-cufile-cu12 \
+            nvidia-curand-cu12 \
+            nvidia-cusolver-cu12 \
+            nvidia-cusparse-cu12 \
+            nvidia-cusparselt-cu12 \
+            nvidia-nccl-cu12 \
+            nvidia-nvjitlink-cu12 \
+            nvidia-nvshmem-cu12 \
+            nvidia-nvtx-cu12 \
+            --index-url https://download.pytorch.org/whl/cu128
+          python3 -c "import torch; print(f'Torch: {torch.__version__}'); print(f'CUDA: {torch.version.cuda}')"
+
+      # -----------------------------------------------------------------------
+      # 4. Install Python build-time dependencies
+      # -----------------------------------------------------------------------
+      - name: Install build dependencies
+        run: |
+          pip3 install --ignore-installed \
+            setuptools \
+            wheel \
+            ninja \
+            psutil \
+            jaxtyping \
+            tyro \
+            opencv-python-headless \
+            plyfile \
+            open3d \
+            matplotlib \
+            Pillow \
+            rawpy \
+            pytorch-msssim \
+            "torchmetrics[image]" \
+            typing_extensions \
+            tabulate
+
+      # -----------------------------------------------------------------------
+      # 5. Patch torch to ignore CUDA version mismatch (HAPPENS LAST)
+      #    We do this here because Step 4 might have re-installed torch.
+      # -----------------------------------------------------------------------
+      - name: Patch PyTorch
+        run: |
+          TORCH_PATH=$(python3 -c "import torch, os; print(os.path.dirname(torch.__file__))")
+          echo "Patching torch at: ${TORCH_PATH}"
+          
+          # 1. Delete compiled bytecode to force reload
+          find "${TORCH_PATH}" -name "*.pyc" -delete
+          
+          # 2. Global replacement of the specific error
+          # This replaces any 'raise RuntimeError(CUDA_MISMATCH_MESSAGE' with 'pass'
+          sed -i 's/raise RuntimeError(CUDA_MISMATCH_MESSAGE/pass #/g' "${TORCH_PATH}/utils/cpp_extension.py"
+          
+          # 3. Double-check for type-hinted signatures just in case
+          sed -i '/def _check_cuda_version(/a \    return' "${TORCH_PATH}/utils/cpp_extension.py"
+          
+          # Verify the patch
+          grep -A 2 "_check_cuda_version" "${TORCH_PATH}/utils/cpp_extension.py"
+          grep "pass #" "${TORCH_PATH}/utils/cpp_extension.py" || true
+
+      # -----------------------------------------------------------------------
+      # 5. Build spirulae_splat wheel
+      #    TORCH_CUDA_ARCH_LIST targets: T4=7.5, A100=8.0, A10G/L4=8.6, H100=9.0
+      #    MAX_JOBS=4 keeps memory usage reasonable on the runner
+      # -----------------------------------------------------------------------
+      - name: Build spirulae_splat wheel
+        working-directory: upstream
+        env:
+          TORCH_CUDA_ARCH_LIST: "7.5;8.0;8.6;9.0"
+          MAX_JOBS: "2"
+        run: |
+          echo "Building spirulae_splat wheel..."
+          pip3 wheel . \
+            --no-build-isolation \
+            --no-deps \
+            -w ../wheelhouse/ \
+            -v
+          echo "=== Wheel contents ==="
+          ls -lh ../wheelhouse/
+
+      # -----------------------------------------------------------------------
+      # 5b. Check for undefined PyTorch symbols — catches Colab ABI mismatches
+      #     before the wheel is published, avoiding a 50-min rebuild loop.
+      # -----------------------------------------------------------------------
+      - name: Verify no undefined PyTorch symbols
+        run: |
+          WHL=$(ls wheelhouse/spirulae_splat*.whl | head -1)
+          TMP=$(mktemp -d)
+          cd "$TMP"
+          python3 -m zipfile -e "$OLDPWD/$WHL" .
+          SO=$(find . -name "*.so" | head -1)
+          echo "Checking $SO ..."
+          BAD=$(nm -D --undefined-only "$SO" | grep 'c10::cuda::' || true)
+          if [ -n "$BAD" ]; then
+            echo "❌ Undefined PyTorch symbols found — will crash on Colab:"
+            echo "$BAD"
+            exit 1
+          fi
+          echo "✅ No undefined PyTorch symbols."
+
+      # -----------------------------------------------------------------------
+      # 6. Build fused_bilagrid wheel (separate CUDA extension dependency)
+      # -----------------------------------------------------------------------
+      - name: Build fused_bilagrid wheel
+        working-directory: upstream
+        env:
+          TORCH_CUDA_ARCH_LIST: "7.5;8.0;8.6;9.0"
+          MAX_JOBS: "2"
+        run: |
+          echo "Building fused_bilagrid wheel..."
+          pip3 wheel \
+            "fused_bilagrid @ git+https://github.com/harry7557558/fused-bilagrid.git@dev" \
+            --no-build-isolation \
+            --no-deps \
+            -w ../wheelhouse/
+          echo "=== All wheels ==="
+          ls -lh ../wheelhouse/
+
+      # -----------------------------------------------------------------------
+      # 7. Always upload wheels as a workflow artifact (accessible even without
+      #    a Release, e.g. on PR builds or failed Release uploads)
+      # -----------------------------------------------------------------------
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: spirulae-wheels
+          path: wheelhouse/*.whl
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      # 8. Determine the release tag
+      # -----------------------------------------------------------------------
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=build-${{ github.run_number }}" >> $GITHUB_OUTPUT
+          fi
+
+      # -----------------------------------------------------------------------
+      # 9. Create or update GitHub Release with the wheels attached
+      # -----------------------------------------------------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "Wheel Build #${{ github.run_number }}"
+          body: |
+            ## Pre-built wheels for spirulae-splat
+
+            Built automatically from commit `${{ github.sha }}` on branch `${{ github.ref_name }}`.
+
+            | Package | PyTorch | CUDA | GPU Targets |
+            |---|---|---|---|
+            | spirulae_splat | 2.10.0 | 12.8 | T4 (7.5), A100 (8.0), A10G/L4 (8.6), H100 (9.0) |
+            | fused_bilagrid | 2.10.0 | 12.8 | T4 (7.5), A100 (8.0), A10G/L4 (8.6), H100 (9.0) |
+
+            ### Usage in Google Colab
+            ```python
+            # Replace BUILD_N with the build number (e.g. build-1)
+            BASE = "https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}"
+            !pip install {BASE}/spirulae_splat-*.whl
+            !pip install {BASE}/fused_bilagrid-*.whl
+            ```
+
+            > **Note:** These wheels are tied to **PyTorch 2.10.0 + CUDA 12.8**. If Colab updates its default PyTorch, re-trigger this workflow via the Actions tab → "Run workflow".
+          files: wheelhouse/*.whl
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
