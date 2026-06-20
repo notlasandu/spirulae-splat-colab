@@ -203,7 +203,7 @@ jobs:
         run: |
           echo "Building fused_bilagrid wheel..."
           pip3 wheel \
-            "fused_bilagrid @ git+https://github.com/harry7557558/fused-bilagrid.git@dev" \
+            "fused_bilagrid @ git+https://github.com/harry7557558/fused-bilagrid.git" \
             --no-build-isolation \
             --no-deps \
             -w ../wheelhouse/
