@@ -103,8 +103,11 @@ jobs:
       # -----------------------------------------------------------------------
       - name: Install build dependencies
         run: |
+          # Remove Ubuntu 22.04 system pkg_resources so Python 3.12 never falls back to it
+          rm -rf /usr/lib/python3/dist-packages/pkg_resources* /usr/lib/python3/dist-packages/setuptools*
+          
           pip3 install --ignore-installed \
-            setuptools \
+            "setuptools<72" \
             wheel \
             ninja \
             psutil \
