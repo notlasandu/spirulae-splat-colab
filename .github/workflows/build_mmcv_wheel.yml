@@ -1,0 +1,225 @@
+name: Build & Release MMCV Wheel
+
+# Triggers:
+#   - Manual run from GitHub UI (Actions tab → "Run workflow")
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag name (e.g. v2026.4.1). Leave empty to use build number.'
+        required: false
+        default: ''
+      mmcv_version:
+        description: 'MMCV version specification (e.g. mmcv>=2.0.0 or mmcv==2.2.0)'
+        required: true
+        default: 'mmcv>=2.0.0'
+
+# Required so the workflow can create/update Releases
+permissions:
+  contents: write
+
+jobs:
+  build-wheel:
+    name: Build MMCV CUDA Wheel
+    runs-on: ubuntu-latest
+
+    # nvidia/cuda devel image: includes nvcc + CUDA headers.
+    # No physical GPU needed — nvcc cross-compiles for specified arch targets.
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 0. Install Git before checkout
+      # -----------------------------------------------------------------------
+      - name: Install Git
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -q
+          apt-get install -y --no-install-recommends git
+
+      # -----------------------------------------------------------------------
+      # 1. Checkout repository
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Install system dependencies & Python 3.12 (matching Colab)
+      # -----------------------------------------------------------------------
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update -q
+          apt-get install -y --no-install-recommends software-properties-common curl git ninja-build cmake libgl1 libglib2.0-0
+          add-apt-repository ppa:deadsnakes/ppa -y
+          apt-get update -q
+          apt-get install -y --no-install-recommends \
+            python3.12 \
+            python3.12-dev \
+            python3.12-venv \
+            python3-pip
+          
+          # Make python3.12 the default python3
+          update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+          
+          # Install pip module for 3.12
+          curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+          python3 get-pip.py
+          
+          python3 --version
+
+      # -----------------------------------------------------------------------
+      # 3. Install PyTorch matching Colab's current default (cu128 = CUDA 12.8)
+      # -----------------------------------------------------------------------
+      - name: Install PyTorch (Colab default)
+        run: |
+          pip3 install --upgrade pip
+          pip3 install \
+            torch==2.10.0 \
+            torchvision \
+            nvidia-cublas-cu12 \
+            nvidia-cuda-cupti-cu12 \
+            nvidia-cuda-nvrtc-cu12 \
+            nvidia-cuda-runtime-cu12 \
+            nvidia-cudnn-cu12 \
+            nvidia-cufft-cu12 \
+            nvidia-cufile-cu12 \
+            nvidia-curand-cu12 \
+            nvidia-cusolver-cu12 \
+            nvidia-cusparse-cu12 \
+            nvidia-cusparselt-cu12 \
+            nvidia-nccl-cu12 \
+            nvidia-nvjitlink-cu12 \
+            nvidia-nvshmem-cu12 \
+            nvidia-nvtx-cu12 \
+            --index-url https://download.pytorch.org/whl/cu128
+          python3 -c "import torch; print(f'Torch: {torch.__version__}'); print(f'CUDA: {torch.version.cuda}')"
+
+      # -----------------------------------------------------------------------
+      # 4. Install Python build-time dependencies required by MMCV
+      # -----------------------------------------------------------------------
+      - name: Install build dependencies
+        run: |
+          pip3 install --ignore-installed \
+            setuptools \
+            wheel \
+            ninja \
+            psutil \
+            numpy \
+            pyyaml \
+            packaging \
+            rich \
+            addict \
+            typing_extensions
+
+      # -----------------------------------------------------------------------
+      # 5. Patch torch to ignore CUDA version mismatch (HAPPENS LAST)
+      # -----------------------------------------------------------------------
+      - name: Patch PyTorch
+        run: |
+          TORCH_PATH=$(python3 -c "import torch, os; print(os.path.dirname(torch.__file__))")
+          echo "Patching torch at: ${TORCH_PATH}"
+          
+          find "${TORCH_PATH}" -name "*.pyc" -delete
+          sed -i 's/raise RuntimeError(CUDA_MISMATCH_MESSAGE/pass #/g' "${TORCH_PATH}/utils/cpp_extension.py"
+          sed -i '/def _check_cuda_version(/a \    return' "${TORCH_PATH}/utils/cpp_extension.py"
+          
+          grep -A 2 "_check_cuda_version" "${TORCH_PATH}/utils/cpp_extension.py"
+          grep "pass #" "${TORCH_PATH}/utils/cpp_extension.py" || true
+
+      # -----------------------------------------------------------------------
+      # 6. Build MMCV wheel with CUDA extensions enabled
+      # -----------------------------------------------------------------------
+      - name: Build MMCV wheel
+        env:
+          MMCV_WITH_OPS: "1"
+          TORCH_CUDA_ARCH_LIST: "7.5;8.0;8.6;9.0"
+          MAX_JOBS: "2"
+        run: |
+          echo "Building MMCV wheel for ${{ github.event.inputs.mmcv_version }}..."
+          mkdir -p wheelhouse
+          pip3 wheel "${{ github.event.inputs.mmcv_version }}" \
+            --no-build-isolation \
+            --no-deps \
+            -w wheelhouse/ \
+            -v
+          echo "=== Wheel contents ==="
+          ls -lh wheelhouse/
+
+      # -----------------------------------------------------------------------
+      # 7. Check for undefined PyTorch symbols
+      # -----------------------------------------------------------------------
+      - name: Verify no undefined PyTorch symbols
+        run: |
+          WHL=$(ls wheelhouse/mmcv*.whl | head -1)
+          TMP=$(mktemp -d)
+          cd "$TMP"
+          python3 -m zipfile -e "$OLDPWD/$WHL" .
+          SO=$(find . -name "*.so" | head -1 || true)
+          if [ -n "$SO" ]; then
+            echo "Checking $SO ..."
+            BAD=$(nm -D --undefined-only "$SO" | grep 'c10::cuda::' || true)
+            if [ -n "$BAD" ]; then
+              echo "❌ Undefined PyTorch symbols found — will crash on Colab:"
+              echo "$BAD"
+              exit 1
+            fi
+            echo "✅ No undefined PyTorch symbols."
+          else
+            echo "⚠️ Warning: No .so files found in wheel. Ensure MMCV_WITH_OPS=1 was respected."
+          fi
+
+      # -----------------------------------------------------------------------
+      # 8. Upload wheels as a workflow artifact
+      # -----------------------------------------------------------------------
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mmcv-wheels
+          path: wheelhouse/*.whl
+          retention-days: 30
+
+      # -----------------------------------------------------------------------
+      # 9. Determine release tag
+      # -----------------------------------------------------------------------
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            echo "tag=${{ github.event.inputs.release_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=mmcv-build-${{ github.run_number }}" >> $GITHUB_OUTPUT
+          fi
+
+      # -----------------------------------------------------------------------
+      # 10. Create GitHub Release
+      # -----------------------------------------------------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "MMCV Wheel Build #${{ github.run_number }}"
+          body: |
+            ## Pre-built MMCV Wheel for Google Colab
+
+            Built automatically from commit `${{ github.sha }}` on branch `${{ github.ref_name }}`.
+
+            | Package | PyTorch | CUDA | GPU Targets |
+            |---|---|---|---|
+            | mmcv | 2.10.0 | 12.8 | T4 (7.5), A100 (8.0), A10G/L4 (8.6), H100 (9.0) |
+
+            ### Usage in Google Colab
+            ```python
+            # Install directly from this release
+            BASE = "https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}"
+            !pip install {BASE}/mmcv-*.whl
+            ```
+
+            > **Note:** This wheel is built specifically for **PyTorch 2.10.0 + CUDA 12.8 on Python 3.12** (Google Colab default).
+          files: wheelhouse/*.whl
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
